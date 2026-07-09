@@ -1,0 +1,321 @@
+<p>Every AI project I have seen in the last two years starts the same way: someone opens a chat window, pastes in real data, gets an impressive answer, and concludes that the product should be built on a large language model. Ours started that way too. At the IT Consulting startup where I work, the recruiting team wanted a tool that could take a candidate’s resume and a job description and answer one question: <em>how well does this person match this role?</em></p>
+
+<p>The proof of concept was exactly what you would expect. We pasted sample resumes and sample job descriptions into cloud LLM APIs and asked for a match assessment. The answers read beautifully. And then three problems surfaced, none of which had anything to do with answer quality:</p>
+
+<ol>
+  <li>
+    <p><strong>Cost didn’t align with how we actually pay for things.</strong> As a startup, we run on Azure credits. Anything that executes inside our tenant — compute, storage, databases — is effectively covered by spend we have already committed. Third-party LLM APIs are a separate invoice, in real cash, that grows per comparison. Ranking every candidate against every open requisition is a multiplicative workload: 200 resumes against 10 job descriptions is 2,000 LLM calls, and that’s one re-rank. The bill wasn’t hypothetically large; it was structurally misaligned with where our money already was.</p>
+  </li>
+  <li>
+    <p><strong>Candidate PII was leaving our boundary.</strong> Resumes are dense with personal data — names, addresses, phone numbers, employment history. Sending them to a third-party model provider puts a vendor in the data path, with everything that implies: data processing agreements, retention questions, and a compliance story that gets harder in regulated industries. We wanted candidate data to never leave our own cloud tenant.</p>
+  </li>
+  <li>
+    <p><strong>The scores weren’t defensible.</strong> Ask an LLM to score the same resume against the same job description twice and you can get two different numbers, each wrapped in fluent, confident prose. For a hiring tool, that is not a cosmetic flaw. If a recruiter — or a regulator — asks <em>why did this candidate score 72?</em>, “the model felt that way at that temperature” is not an answer.</p>
+  </li>
+</ol>
+
+<p>We also looked at commercial resume-matching products, and found what most small companies find: they are priced and packaged for enterprise HR departments, not for a startup that wants one focused workflow.</p>
+
+<p>So we stopped and asked a more basic question: what is this task, actually? And the answer changed the architecture entirely. <strong>Matching a resume to a job description is a ranking problem, not a generation problem.</strong> Nothing needs to be written. No prose needs to be produced. We need a similarity signal, a skill overlap signal, and a deterministic way to combine them into a score a human can interrogate.</p>
+
+<p>That realization let us delete the LLM from the design. What we shipped instead is a two-container system built on a 110M-parameter sentence embedding model, cosine similarity, and Azure SQL — no generative model, no GPU, no dedicated vector database, and no byte of candidate data leaving our tenant. This post walks through how it works.</p>
+
+<p><strong>Who this is for</strong>: engineers who have been told to “add AI” to an internal tool and suspect the task might not need a generative model; teams in regulated or privacy-sensitive domains who want AI-assisted workflows without a third-party model vendor in the data path; and anyone curious what Azure SQL’s native <code class="language-plaintext highlighter-rouge">VECTOR</code> type looks like in production-shaped code. All code in this post has been rewritten and simplified for illustration — it shows the real algorithms, not the verbatim production source.</p>
+
+<hr />
+
+<h2 id="the-obvious-objection-why-not-azure-openai">The Obvious Objection: Why Not Azure OpenAI?</h2>
+
+<p>Before the architecture, the question any Azure shop will ask first. If the constraints are “burn Azure credits” and “keep data in the tenant,” Azure OpenAI Service satisfies both: it bills against Azure spend, runs inside your subscription boundary, and Microsoft contractually does not train on your data.</p>
+
+<p>We could have used it, and for a generation-shaped task we would have. But it does nothing for the third problem. A generative model — wherever it runs — gives you non-deterministic scores and explanations that are <em>narratives about</em> the score rather than <em>derivations of</em> it. Hiring is a domain where “show your work” is not optional (more on the regulatory angle later). Once we accepted that the task was ranking, not generation, the deciding pillar was determinism and explainability, and no deployment model of a generative LLM provides that. An embedding model does, trivially: the same text produces the same vector, every time, and every point of the final score traces to either a named cosine similarity or a named missing skill.</p>
+
+<h2 id="architecture-overview">Architecture Overview</h2>
+
+<p>The whole system is two containers and a database:</p>
+
+<pre><code class="language-mermaid">flowchart LR
+    subgraph tenant["Company Azure Tenant"]
+        UI["Streamlit UI&lt;br/&gt;(thin client, Azure AD OAuth2)"]
+        API["FastAPI Service&lt;br/&gt;embedding · chunking · skill extraction&lt;br/&gt;scoring · PDF reports&lt;br/&gt;&lt;i&gt;all-mpnet-base-v2 baked into image&lt;/i&gt;"]
+        DB[("Azure SQL&lt;br/&gt;VECTOR(768) columns")]
+        Portal["Existing Web Portal"]
+    end
+    Portal -- "POST /candidates/upload&lt;br/&gt;(API key + AD token)" --&gt; API
+    UI -- "REST" --&gt; API
+    API --&gt; DB
+</code></pre>
+
+<ul>
+  <li><strong>FastAPI backend</strong> owns every piece of logic: parsing DOCX/PDF documents into sections, embedding them, extracting skills, computing scores, and rendering PDF scorecards. The embedding model — <code class="language-plaintext highlighter-rouge">sentence-transformers/all-mpnet-base-v2</code>, 768 dimensions, CPU-only — is downloaded at <em>image build time</em> and baked into the container. At runtime, nothing calls out to anything. The container runs comfortably on 2 vCPU / 4 GB on Azure Container Apps.</li>
+  <li><strong>Streamlit UI</strong> is a deliberately thin client. Zero business logic; every action is a REST call to the API. Recruiters authenticate via Azure AD OAuth2. Keeping the UI dumb means the API is the single place where behavior lives — and the UI layer is swappable when Streamlit stops being enough.</li>
+  <li><strong>Azure SQL</strong> is both the application database and the vector store. Section embeddings live in native <code class="language-plaintext highlighter-rouge">VECTOR(768)</code> columns next to the relational data they describe. No Pinecone, no Qdrant, no second system to operate.</li>
+</ul>
+
+<p>There is a fourth participant: the company’s existing web portal pushes candidate uploads directly into the API through a dual-authenticated endpoint (API key plus Azure AD bearer token), so resumes flow in without anyone re-uploading them.</p>
+
+<p>The data path is the point of this diagram: every arrow starts and ends inside the tenant. There is no arrow leaving the box.</p>
+
+<h2 id="deep-dive-1-section-aware-embedding-and-best-match-cosine">Deep Dive 1: Section-Aware Embedding and Best-Match Cosine</h2>
+
+<p>The naive approach — embed the whole resume, embed the whole job description, take one cosine similarity — produces one mushy number. Resumes and JDs are both <em>structured</em> documents wearing unstructured clothes: a JD has responsibilities, required qualifications, preferred qualifications; a resume has experience, skills, education, projects. A single whole-document vector averages all of that into semantic soup, and a candidate with a stellar skills section and an irrelevant hobbies section looks the same as a uniformly mediocre one.</p>
+
+<p>So we never embed whole documents. At upload time, documents are split into sections (heading-style detection for DOCX, capitalization heuristics for PDF — more on the brittleness of that later), and each section is embedded and stored individually:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+</pre></td><td class="rouge-code"><pre><span class="kn">from</span> <span class="n">sentence_transformers</span> <span class="kn">import</span> <span class="n">SentenceTransformer</span>
+
+<span class="n">model</span> <span class="o">=</span> <span class="nc">SentenceTransformer</span><span class="p">(</span><span class="sh">"</span><span class="s">sentence-transformers/all-mpnet-base-v2</span><span class="sh">"</span><span class="p">)</span>
+
+<span class="k">def</span> <span class="nf">embed</span><span class="p">(</span><span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="c1"># normalize_embeddings=True → unit vectors, so cosine similarity
+</span>    <span class="c1"># later reduces to a plain dot product
+</span>    <span class="k">return</span> <span class="n">model</span><span class="p">.</span><span class="nf">encode</span><span class="p">(</span><span class="n">text</span><span class="p">,</span> <span class="n">normalize_embeddings</span><span class="o">=</span><span class="bp">True</span><span class="p">)</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>That <code class="language-plaintext highlighter-rouge">normalize_embeddings=True</code> is doing quiet work: with unit-length vectors, cosine similarity is just <code class="language-plaintext highlighter-rouge">np.dot(a, b)</code> — no norms to compute at query time.</p>
+
+<p>The scoring side is where the design earns its keep. The obvious follow-up mistake would be to match sections <em>by name</em> — compare the JD’s “Requirements” to the resume’s “Requirements.” But resumes don’t have a Requirements section, and no two resumes name their sections the same way. Instead, for <strong>each JD section, we take the best cosine similarity across all candidate sections</strong>, wherever it is found:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+</pre></td><td class="rouge-code"><pre><span class="c1"># Simplified for illustration
+</span><span class="k">def</span> <span class="nf">semantic_score</span><span class="p">(</span><span class="n">jd_sections</span><span class="p">,</span> <span class="n">cand_sections</span><span class="p">,</span> <span class="n">weights</span><span class="p">):</span>
+    <span class="sh">"""</span><span class="s">jd_sections / cand_sections: list of (name, unit_vector).</span><span class="sh">"""</span>
+    <span class="n">weighted_sum</span><span class="p">,</span> <span class="n">total_weight</span> <span class="o">=</span> <span class="mf">0.0</span><span class="p">,</span> <span class="mf">0.0</span>
+
+    <span class="k">for</span> <span class="n">jd_name</span><span class="p">,</span> <span class="n">jd_vec</span> <span class="ow">in</span> <span class="n">jd_sections</span><span class="p">:</span>
+        <span class="c1"># Best match across ALL candidate sections — section names
+</span>        <span class="c1"># never need to line up
+</span>        <span class="n">best</span> <span class="o">=</span> <span class="nf">max</span><span class="p">(</span><span class="n">np</span><span class="p">.</span><span class="nf">dot</span><span class="p">(</span><span class="n">jd_vec</span><span class="p">,</span> <span class="n">cand_vec</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">cand_vec</span> <span class="ow">in</span> <span class="n">cand_sections</span><span class="p">)</span>
+
+        <span class="n">weight</span> <span class="o">=</span> <span class="nf">resolve_weight</span><span class="p">(</span><span class="n">jd_name</span><span class="p">,</span> <span class="n">weights</span><span class="p">)</span>   <span class="c1"># e.g. "requirements" → 0.35
+</span>        <span class="n">weighted_sum</span> <span class="o">+=</span> <span class="n">best</span> <span class="o">*</span> <span class="n">weight</span>
+        <span class="n">total_weight</span> <span class="o">+=</span> <span class="n">weight</span>
+
+    <span class="k">return</span> <span class="n">weighted_sum</span> <span class="o">/</span> <span class="n">total_weight</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>This is section-name-agnostic by construction. If the JD’s “Required Qualifications” content is best answered by the resume’s “Professional Experience” section, that’s the pairing that counts — and we record <em>which</em> candidate section won, because that pairing is part of the explanation shown to the recruiter.</p>
+
+<p>The <code class="language-plaintext highlighter-rouge">weights</code> come from a <code class="language-plaintext highlighter-rouge">section_weights</code> table that maps keywords to importance (“requirements” sections matter more than “about the company” boilerplate), and the recruiting team can tune them from an admin screen. When weights change after a ranking was computed, the UI shows a staleness banner prompting a re-run — a small feature that prevents a large class of “why do these numbers disagree” confusion.</p>
+
+<p>The asymmetry in the loop is deliberate: we iterate over <em>JD</em> sections, not resume sections. The job description defines what matters; the resume is searched for evidence. A resume section that matches nothing in the JD simply contributes nothing — it isn’t penalized, it’s ignored.</p>
+
+<h2 id="deep-dive-2-an-explainable-composite-score">Deep Dive 2: An Explainable Composite Score</h2>
+
+<p>Semantic similarity alone over-rewards fluent, keyword-adjacent writing. A resume can <em>sound</em> like a job description without the candidate ever having used the required tools. So the final score is a composite of two components:</p>
+
+<p><strong><code class="language-plaintext highlighter-rouge">overall = 0.60 × semantic + 0.40 × skill</code></strong></p>
+
+<p>The skill component is deterministic set arithmetic over skills extracted at upload time (extraction itself is covered below). Three rules give it its shape:</p>
+
+<ol>
+  <li><strong>Required skills are worth 3× preferred skills.</strong> A JD skill found under a “Required” / “Must have” / “Essential” header carries triple weight. Missing a preferred skill dents the score; missing a required one craters it.</li>
+  <li><strong>Experience gaps are penalized, not zeroed.</strong> If the JD asks for 5 years of Python and the candidate has 3, the match still counts — reduced by 15% per missing year, floored at 50%. A floor matters: a strong candidate one year short of an arbitrary threshold should be <em>visible</em>, not filtered out.</li>
+  <li><strong>No skill data, no penalty.</strong> If either side lacks a years figure, the multiplier is 1.0. The system never punishes a candidate for information the parser failed to find.</li>
+</ol>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+</pre></td><td class="rouge-code"><pre><span class="c1"># Simplified for illustration
+</span><span class="n">REQUIRED_MULTIPLIER</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="n">PENALTY_PER_YEAR</span> <span class="o">=</span> <span class="mf">0.15</span>
+<span class="n">PENALTY_FLOOR</span> <span class="o">=</span> <span class="mf">0.5</span>
+
+<span class="k">def</span> <span class="nf">years_penalty</span><span class="p">(</span><span class="n">jd_years</span><span class="p">,</span> <span class="n">cand_years</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">jd_years</span> <span class="ow">is</span> <span class="bp">None</span> <span class="ow">or</span> <span class="n">cand_years</span> <span class="ow">is</span> <span class="bp">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mf">1.0</span>                        <span class="c1"># missing data → benefit of the doubt
+</span>    <span class="n">gap</span> <span class="o">=</span> <span class="nf">max</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">jd_years</span> <span class="o">-</span> <span class="n">cand_years</span><span class="p">)</span>
+    <span class="k">return</span> <span class="nf">max</span><span class="p">(</span><span class="n">PENALTY_FLOOR</span><span class="p">,</span> <span class="mf">1.0</span> <span class="o">-</span> <span class="n">gap</span> <span class="o">*</span> <span class="n">PENALTY_PER_YEAR</span><span class="p">)</span>
+
+<span class="k">def</span> <span class="nf">skill_score</span><span class="p">(</span><span class="n">jd_skills</span><span class="p">,</span> <span class="n">cand_skills</span><span class="p">):</span>
+    <span class="sh">"""</span><span class="s">jd_skills: {skill_id: {required: bool, years: int|None}}
+       cand_skills: {skill_id: {years: int|None}}</span><span class="sh">"""</span>
+    <span class="n">total</span> <span class="o">=</span> <span class="nf">sum</span><span class="p">(</span><span class="n">REQUIRED_MULTIPLIER</span> <span class="k">if</span> <span class="n">s</span><span class="p">[</span><span class="sh">"</span><span class="s">required</span><span class="sh">"</span><span class="p">]</span> <span class="k">else</span> <span class="mi">1</span>
+                <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">jd_skills</span><span class="p">.</span><span class="nf">values</span><span class="p">())</span>
+    <span class="k">if</span> <span class="n">total</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mf">1.0</span>
+
+    <span class="n">earned</span> <span class="o">=</span> <span class="mf">0.0</span>
+    <span class="k">for</span> <span class="n">skill_id</span><span class="p">,</span> <span class="n">jd_info</span> <span class="ow">in</span> <span class="n">jd_skills</span><span class="p">.</span><span class="nf">items</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">skill_id</span> <span class="ow">in</span> <span class="n">cand_skills</span><span class="p">:</span>
+            <span class="n">worth</span> <span class="o">=</span> <span class="n">REQUIRED_MULTIPLIER</span> <span class="k">if</span> <span class="n">jd_info</span><span class="p">[</span><span class="sh">"</span><span class="s">required</span><span class="sh">"</span><span class="p">]</span> <span class="k">else</span> <span class="mi">1</span>
+            <span class="n">earned</span> <span class="o">+=</span> <span class="n">worth</span> <span class="o">*</span> <span class="nf">years_penalty</span><span class="p">(</span><span class="n">jd_info</span><span class="p">[</span><span class="sh">"</span><span class="s">years</span><span class="sh">"</span><span class="p">],</span>
+                                            <span class="n">cand_skills</span><span class="p">[</span><span class="n">skill_id</span><span class="p">][</span><span class="sh">"</span><span class="s">years</span><span class="sh">"</span><span class="p">])</span>
+    <span class="k">return</span> <span class="n">earned</span> <span class="o">/</span> <span class="n">total</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Every constant in that snippet — the 60/40 split, the 3× multiplier, the 15% penalty, the 50% floor — is a policy decision sitting in plain sight, arguable and changeable. That is the property we could never get from a generative model. When a recruiter opens a candidate’s scorecard, they don’t see a paragraph of AI prose; they see: this JD section matched that resume section at 0.81, these four required skills matched, this one is missing, this one matched with a two-year experience gap. Score the same pair tomorrow, get the same number. Change a weight, and the change is visible, versioned, and explainable.</p>
+
+<p>The output is a structured result — overall score, both components, per-section pairings with similarities, and a full skill breakdown (matched / missing-required / missing-preferred / extra) — which drives both the UI detail view and a generated PDF scorecard.</p>
+
+<h2 id="deep-dive-3-azure-sql-as-the-vector-store">Deep Dive 3: Azure SQL as the Vector Store</h2>
+
+<p>The reflexive move in 2026 is to add a vector database the moment embeddings appear in a design. We didn’t, for a boring reason: Azure SQL (and SQL Server 2025) has a native <code class="language-plaintext highlighter-rouge">VECTOR</code> type, and our scale — thousands of candidates, not millions — doesn’t need approximate nearest-neighbor indexes. Every vector we need for one ranking fits in memory of a small container.</p>
+
+<p>Embeddings live in the same schema as everything else:</p>
+
+<div class="language-sql highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+</pre></td><td class="rouge-code"><pre><span class="c1">-- Simplified for illustration</span>
+<span class="k">CREATE</span> <span class="k">TABLE</span> <span class="n">jd_sections</span> <span class="p">(</span>
+    <span class="n">id</span>            <span class="nb">INT</span> <span class="k">IDENTITY</span> <span class="k">PRIMARY</span> <span class="k">KEY</span><span class="p">,</span>
+    <span class="n">jd_id</span>         <span class="nb">INT</span> <span class="k">NOT</span> <span class="k">NULL</span> <span class="k">REFERENCES</span> <span class="n">job_descriptions</span><span class="p">(</span><span class="n">id</span><span class="p">),</span>
+    <span class="n">section_name</span>  <span class="n">NVARCHAR</span><span class="p">(</span><span class="mi">200</span><span class="p">)</span> <span class="k">NOT</span> <span class="k">NULL</span><span class="p">,</span>
+    <span class="n">section_order</span> <span class="nb">INT</span> <span class="k">NOT</span> <span class="k">NULL</span><span class="p">,</span>
+    <span class="n">content</span>       <span class="n">NVARCHAR</span><span class="p">(</span><span class="k">MAX</span><span class="p">)</span> <span class="k">NOT</span> <span class="k">NULL</span><span class="p">,</span>
+    <span class="n">embedding</span>     <span class="n">VECTOR</span><span class="p">(</span><span class="mi">768</span><span class="p">)</span> <span class="k">NOT</span> <span class="k">NULL</span>
+<span class="p">);</span>
+<span class="c1">-- candidate_sections is the mirror image, keyed by candidate_id</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>The practical wrinkle is the driver. <code class="language-plaintext highlighter-rouge">pyodbc</code> has no native <code class="language-plaintext highlighter-rouge">VECTOR</code> binding, so vectors cross the wire as JSON strings and get cast at the SQL boundary:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+</pre></td><td class="rouge-code"><pre><span class="c1"># Simplified for illustration
+</span><span class="kn">import</span> <span class="n">json</span><span class="p">,</span> <span class="n">numpy</span> <span class="k">as</span> <span class="n">np</span>
+
+<span class="k">def</span> <span class="nf">vector_to_sql</span><span class="p">(</span><span class="n">vec</span><span class="p">:</span> <span class="n">np</span><span class="p">.</span><span class="n">ndarray</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">json</span><span class="p">.</span><span class="nf">dumps</span><span class="p">(</span><span class="n">vec</span><span class="p">.</span><span class="nf">tolist</span><span class="p">())</span>          <span class="c1"># "[0.0123, -0.0456, ...]"
+</span>
+<span class="c1"># INSERT: cast the JSON parameter to VECTOR(768)
+</span><span class="n">cursor</span><span class="p">.</span><span class="nf">execute</span><span class="p">(</span>
+    <span class="sh">"</span><span class="s">INSERT INTO jd_sections (jd_id, section_name, section_order, content, embedding) </span><span class="sh">"</span>
+    <span class="sh">"</span><span class="s">VALUES (?, ?, ?, ?, CAST(CONVERT(NVARCHAR(MAX), ?) AS VECTOR(768)))</span><span class="sh">"</span><span class="p">,</span>
+    <span class="n">jd_id</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">order</span><span class="p">,</span> <span class="n">text</span><span class="p">,</span> <span class="nf">vector_to_sql</span><span class="p">(</span><span class="n">vec</span><span class="p">),</span>
+<span class="p">)</span>
+
+<span class="c1"># SELECT: cast back to NVARCHAR and parse
+</span><span class="n">cursor</span><span class="p">.</span><span class="nf">execute</span><span class="p">(</span>
+    <span class="sh">"</span><span class="s">SELECT section_name, CAST(embedding AS NVARCHAR(MAX)) </span><span class="sh">"</span>
+    <span class="sh">"</span><span class="s">FROM jd_sections WHERE jd_id = ?</span><span class="sh">"</span><span class="p">,</span> <span class="n">jd_id</span><span class="p">)</span>
+<span class="n">sections</span> <span class="o">=</span> <span class="p">[(</span><span class="n">row</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">np</span><span class="p">.</span><span class="nf">array</span><span class="p">(</span><span class="n">json</span><span class="p">.</span><span class="nf">loads</span><span class="p">(</span><span class="n">row</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="p">.</span><span class="n">float32</span><span class="p">))</span>
+            <span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">cursor</span><span class="p">.</span><span class="nf">fetchall</span><span class="p">()]</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Is JSON-serializing floats elegant? No. Does it matter at this scale? Also no — a full ranking of every active candidate against a JD is a few hundred small reads followed by NumPy dot products, and it completes interactively.</p>
+
+<p>What we bought by <em>not</em> adding a vector database: one system to secure, back up, and grant access to; vectors that live transactionally next to the rows they describe (delete a candidate, their embeddings go with them — GDPR erasure is one <code class="language-plaintext highlighter-rouge">DELETE</code>); and the entire compliance story of “where is candidate data?” answered with “the same Azure SQL database as before.” Azure SQL also has a native <code class="language-plaintext highlighter-rouge">VECTOR_DISTANCE()</code> function for pushing similarity into the database; we compute in Python instead because the best-match-per-section logic and the audit trail of section pairings are easier to express there, and the data volumes make the transfer cost irrelevant. At a million candidates, this section of the post would be written very differently — that’s the honest boundary of the design.</p>
+
+<h2 id="the-rest-of-the-pipeline-briefly">The Rest of the Pipeline, Briefly</h2>
+
+<p>Three more components deserve a paragraph each.</p>
+
+<p><strong>Skill extraction</strong> runs once at upload time, never at query time, against a curated skill taxonomy with aliases (React = ReactJS = React.js). Three passes, cheapest first: exact whole-word regex; then a normalized pass that strips punctuation and spacing (so Node.js, NodeJS, and “Node JS” collapse); then a fuzzy pass via <code class="language-plaintext highlighter-rouge">rapidfuzz</code> at an 88% similarity threshold for the typos. JD skills found under “Required” / “Must have” / “Essential” headers get the <code class="language-plaintext highlighter-rouge">required</code> flag, and a regex scan of the ±100 characters around each mention pulls out “N+ years” patterns. Extracted skills are stored relationally, which is what makes the skill score pure set arithmetic later.</p>
+
+<p><strong>Section detection</strong> is honest heuristics, not magic. DOCX files offer real structure — heading styles first, bold-line detection as fallback. PDFs offer almost none, so we detect section boundaries by capitalization and title-case patterns. This works on conventionally formatted documents and degrades on creative layouts; it is the most brittle part of the system and the first thing we’d upgrade (a small local layout model could slot in here without changing anything downstream).</p>
+
+<p><strong>The workflow layer</strong> is what turned a scoring engine into a tool the team actually uses: per-JD candidate status (pending → shortlisted / rejected / interviewed / offered) with notes and audit fields, status badges in the ranked list, and the staleness banner mentioned earlier when taxonomy or weights change after a ranking. None of it is technically interesting. All of it is why the tool gets opened.</p>
+
+<h2 id="the-part-most-ai-recruiting-posts-skip-this-is-a-regulated-category">The Part Most AI-Recruiting Posts Skip: This Is a Regulated Category</h2>
+
+<p>Automated tools that influence hiring decisions are not a neutral engineering playground. New York City’s Local Law 144 requires bias audits for automated employment decision tools. The EU AI Act classifies AI used in recruitment as high-risk. The EEOC has published guidance on algorithmic employment assessments. If you are building in this space, this is design input, not legal trivia.</p>
+
+<p>This context reframes the determinism pillar from an engineering preference into a posture:</p>
+
+<ul>
+  <li><strong>Reproducible</strong>: the same resume and JD produce the same score, every run. There is no temperature, no sampling, no “it said something different yesterday.”</li>
+  <li><strong>Decomposable</strong>: every score factors into named cosine similarities and named skill matches with visible weights. If a scoring policy is challenged, the policy is right there in the constants — and changing it is a diff, not a re-prompt.</li>
+  <li><strong>Human-in-the-loop by construction</strong>: the system <em>ranks</em>; it never rejects. Every status change — shortlist, reject, interview — is a recruiter’s explicit action, recorded with who and when. The tool orders a reading list; humans make decisions.</li>
+</ul>
+
+<p>I want to be precise about the claim: this system is <em>designed to be auditable</em> — it has not undergone a formal bias audit. Embedding models carry the biases of their training data, and a deterministic pipeline can encode a biased policy deterministically. What the architecture guarantees is that when an audit happens, there is something concrete to audit: fixed weights, traceable scores, and a recorded human decision at every consequential step. A generative scorer can’t offer that even in principle.</p>
+
+<h2 id="what-this-doesnt-do">What This Doesn’t Do</h2>
+
+<p>An architecture post that hides its limitations is an ad. Ours, honestly:</p>
+
+<ul>
+  <li><strong>Validation is spot-check only so far.</strong> We’ve eyeballed scores across sample resumes and they rank sensibly, but we have not yet run a structured comparison against recruiter judgment (e.g., “does the top 5 match who a human would shortlist?”). That is the next milestone, and until it’s done, claims about matching <em>quality</em> stay modest.</li>
+  <li><strong>Embeddings don’t understand negation or recency.</strong> “Migrated away from Java” and “expert in Java” embed uncomfortably close together, and “used Python in 2015” reads like “uses Python daily.” The years-extraction mitigates some of this for skills; the semantic component remains exposed to it.</li>
+  <li><strong>Section detection is heuristic.</strong> Creative resume layouts, tables, and multi-column PDFs degrade chunking quality, and bad chunks mean bad section scores.</li>
+  <li><strong>The taxonomy is a garden.</strong> Skill extraction is only as good as the skill list and its aliases, and that requires ongoing human curation. The admin CRUD exists precisely because this never becomes “done.”</li>
+  <li><strong>There’s no reranking stage.</strong> A cross-encoder pass over the top-N candidates would likely sharpen the head of the ranking at trivial cost. It’s the most obvious upgrade that preserves every property we care about — still deterministic, still local, still explainable.</li>
+</ul>
+
+<h2 id="could-this-run-fully-on-prem">Could This Run Fully On-Prem?</h2>
+
+<p>A closing note for readers in finance, insurance, and healthcare who read “stays in our tenant” and thought “not good enough.” The primary claim of this build is the tenant boundary: candidate PII never touches a third-party AI vendor. But notice what the architecture <em>doesn’t</em> depend on: no GPU, no external API, no managed AI service. The embedding model is 420 MB of files loaded by a CPU process. Everything except the database would move to an on-prem Docker host unchanged.</p>
+
+<p>The one honest caveat is Azure SQL’s <code class="language-plaintext highlighter-rouge">VECTOR</code> type, which doesn’t exist in on-prem SQL Server 2022 (it arrives with SQL Server 2025). A true air-gapped port today would swap in PostgreSQL with pgvector — a change confined to the serialization helpers and a handful of SQL statements, because the similarity math already lives in Python. The design is cloud-resident by choice, not by dependency.</p>
+
+<h2 id="takeaways">Takeaways</h2>
+
+<ol>
+  <li><strong>Name the task before choosing the model.</strong> “AI that matches resumes to jobs” sounds like an LLM problem. It’s a ranking problem, and ranking needs similarity and scoring, not generation. Asking “what does this task actually produce?” deleted the most expensive and least explainable component from our design.</li>
+  <li><strong>Align architecture with how you already spend.</strong> For a startup on cloud credits, in-tenant compute is effectively pre-paid and third-party API invoices are new cash. That framing — not abstract per-token math — is what made the cost decision obvious.</li>
+  <li><strong>In regulated workflows, determinism is a feature you can’t retrofit.</strong> Reproducible, decomposable scores with a human on every decision is an architecture property. No amount of prompt engineering adds it to a generative scorer afterward.</li>
+  <li><strong>Your database might already be your vector store.</strong> At thousands-of-documents scale, native vector columns next to your relational data beat operating a second system — and inherit its access control, backups, and deletion semantics for free.</li>
+  <li><strong>A 110M-parameter encoder on a CPU is more model than most internal tools need.</strong> The gap between “impressive demo” and “deployable system” was not closed by a bigger model. It was closed by a smaller one, plus arithmetic we can defend.</li>
+</ol>

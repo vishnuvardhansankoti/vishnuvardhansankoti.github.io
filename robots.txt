@@ -1,0 +1,5 @@
+User-agent: *
+
+Disallow: /norobots/
+
+Sitemap: https://vishnuvardhansankoti.github.io/sitemap.xml
